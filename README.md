@@ -1,116 +1,175 @@
-# claude-cache-gate
+# cache-gate-hook
 
-A Claude Code hook that tells you when a session's prompt cache has expired,
-and gates the first prompt you send afterwards so you can decide whether to
-pay for the re-write or start a fresh session.
+A local hook for Codex and Claude Code that warns when a session's prompt
+cache is near expiry. After expiry, it blocks the first submitted prompt and
+requires the exact same prompt to be submitted again.
 
-## Why
+The pause makes the cost visible before a long session rewrites its cached
+context. You can accept that rewrite or start a fresh session.
 
-Claude Code keeps your conversation in Anthropic's prompt cache. The cache
-TTL (1 hour on Claude Code sessions) resets on every request. If you leave a
-session idle past the TTL and come back, the **next turn re-writes the entire
-context** as a cache write — for a 100K+ token session that is the single most
-expensive turn you can send. After that one turn the cache is warm again.
+## Behavior
 
-Nothing in the UI tells you this happened. This hook does.
+| client | default TTL | activity source | behavior after expiry |
+|---|---:|---|---|
+| Claude Code | 60 minutes | Last assistant usage record in the session transcript | Blocks once and reports the approximate context size |
+| Codex | 30 minutes | The last completed turn, recorded by a `Stop` hook | Blocks once and reports that the cache likely expired |
 
-## What it does
+The same safety rule applies to both clients:
 
-`cache_gate.py` runs on `UserPromptSubmit`. It reads the session transcript,
-finds the last assistant turn, and computes idle time:
+1. The first prompt after expiry is blocked.
+2. Submitting the exact same prompt again allows it through.
+3. Submitting a different prompt replaces the blocked prompt, so the new text
+   must also be submitted twice.
+4. A completed turn re-arms the gate for the next expiry.
 
-| idle time | behaviour |
-|---|---|
-| < 50 min | silent |
-| 50–60 min | note: `Prompt cache warm for ~8m more (110K context).` |
-| ≥ 60 min, first submit | **blocked** — prompt is dropped and you see: `Prompt cache expired (idle 1226m ≥ 60m TTL): the next turn re-writes ~110K tokens of context. Blocked once — re-send to pay it, or /handoff and start a fresh session.` |
-| ≥ 60 min, second submit | proceeds, with a `…Proceeding.` note |
+Prompt text is stored only as a SHA-256 hash. Session state lives in
+`~/.cache/cache-gate-hook/` by default.
 
-The block fires once per expiry (a marker in `/tmp` keyed by session id and
-last-turn timestamp), so after the turn runs and the cache is warm again, the
-gate re-arms for the next idle period.
+The TTLs are conservative indicators, not proof of a cache miss. OpenAI states
+that GPT-5.6 and later cached prefixes can be reused for at least 30 minutes
+after the latest write or reuse, and may remain available longer. Anthropic
+documents both five-minute and one-hour prompt cache durations. See the
+[OpenAI prompt caching guide](https://developers.openai.com/api/docs/guides/prompt-caching)
+and the
+[Anthropic prompt caching guide](https://platform.claude.com/docs/en/build-with-claude/prompt-caching).
 
-It always exits 0 and never writes to the model's context — messages go to
-you via `systemMessage`.
+## Install for humans
 
-### Listing all sessions
-
-Before choosing a session to resume, from the project directory:
-
-```
-$ python3 cache_gate.py --list
-session                               last turn            idle     ctx  cache
-0a13365f-0557-5c3b-ae95-86fb1428e37c  2026-09-21 08:10       0m     43K  60m left
-4fcdf2ce-a667-46d3-864f-e321f04f74be  2026-09-20 11:44    1226m    110K  EXPIRED
-```
-
-## Setup — for humans
+Clone the repository to a stable path. The hook configuration contains the
+absolute path to `cache_gate.py`.
 
 ```bash
-git clone https://github.com/avaxML/claude-cache-gate.git ~/Projects/claude-cache-gate
-~/Projects/claude-cache-gate/install.sh
+git clone https://github.com/avaxML/cache-gate-hook.git ~/Projects/cache-gate-hook
+cd ~/Projects/cache-gate-hook
 ```
 
-`install.sh` adds a `UserPromptSubmit` entry to `~/.claude/settings.json`
-pointing at the cloned script (idempotent — re-run after moving the clone).
-Restart Claude Code. That's it; no dependencies beyond Python 3.
+For Claude Code:
 
-To pick a different settings file: `CLAUDE_SETTINGS=path/to/settings.json ./install.sh`.
+```bash
+./install.sh claude
+```
 
-Tune with environment variables (set them where Claude Code is launched):
+This adds one `UserPromptSubmit` hook to `~/.claude/settings.json`. Restart
+Claude Code after installation.
 
-| variable | default | meaning |
-|---|---|---|
-| `CLAUDE_CACHE_TTL_MIN` | `60` | cache TTL in minutes. Use `5` if your setup runs the 5-minute cache. |
-| `CLAUDE_CACHE_WARN_MIN` | `50` | idle minutes after which the "warm for ~Xm" heads-up shows |
+For Codex:
 
-To make it warn-only instead of blocking, edit `hook()` in `cache_gate.py` and
-replace the `{"decision": "block", ...}` print with a `systemMessage`.
+```bash
+./install.sh codex
+```
 
-Uninstall: remove the `cache_gate.py` entry from `hooks.UserPromptSubmit` in
-`~/.claude/settings.json`.
+This adds `SessionStart`, `UserPromptSubmit`, and `Stop` hooks to
+`~/.codex/hooks.json`. Start or resume a Codex session, open `/hooks`, review
+the definitions, and trust them. Codex requires trust for each new or changed
+hook definition. The
+[Codex hooks documentation](https://learn.chatgpt.com/docs/hooks)
+describes this review flow.
 
-## Setup — for agents
+To install both clients:
 
-If you are an AI agent installing this on a user's behalf:
+```bash
+./install.sh all
+```
 
-1. Clone to a stable path: `git clone https://github.com/avaxML/claude-cache-gate.git <path>`.
-2. Run `<path>/install.sh`. It edits `~/.claude/settings.json` in place with
-   Python's `json` module, preserving every other key. Do not hand-edit the
-   file in parallel.
-3. Verify without restarting: feed the hook a synthetic expired transcript and
-   expect a `block` decision on the first call and `Proceeding` on the second:
-   ```bash
-   python3 <path>/tests/test_cache_gate.py
-   ```
-   All four tests must print `ok`. Exit code is the source of truth, not grep.
-4. Tell the user to restart Claude Code — hooks load at session start.
+The installer is idempotent. It replaces older `cache_gate.py` entries and
+preserves unrelated settings and hooks.
 
-Hook contract, if you need to reason about it:
+## Install for agents
 
-- **Input** (stdin JSON from Claude Code): `session_id`, `transcript_path`.
-- **Output** (stdout JSON, exit 0 always): either nothing, `{"systemMessage": "..."}`
-  (shown to the user, not added to context), or
-  `{"decision": "block", "reason": "..."}` (prompt dropped, reason shown).
-- **State**: `/tmp/claude-cache-gate-<session_id>` containing the ISO
-  timestamp of the last assistant turn the block fired for.
-- **Transcript parsing**: JSONL; uses lines with `"type": "assistant"` and a
-  `message.usage` object; skips `isSidechain` lines; context size is
-  `input_tokens + cache_read_input_tokens + cache_creation_input_tokens` of
-  the last such line.
+When an agent installs the hook for a user:
 
-Do not add this hook to a project-level `.claude/settings.json` that is
-committed to a repo — the command contains an absolute path on the user's
-machine. It belongs in the user-level settings file.
+1. Clone `https://github.com/avaxML/cache-gate-hook.git` to a stable path.
+2. Run `install.sh claude`, `install.sh codex`, or `install.sh all` based on the
+   user's requested clients. Running the installer changes user-level agent
+   configuration.
+3. Do not copy these entries into a repository's `.claude/` or `.codex/`
+   directory. The generated command contains a machine-specific absolute path.
+4. Run the verification commands below. Treat their exit codes as the result.
+5. For Claude Code, tell the user to restart the client. For Codex, tell the
+   user to review and trust the definitions in `/hooks`.
+
+The installer accepts alternate files for isolated or managed setups:
+
+```bash
+CLAUDE_SETTINGS=/path/to/settings.json ./install.sh claude
+CODEX_HOOKS=/path/to/hooks.json ./install.sh codex
+```
+
+Hook contracts:
+
+- Claude Code invokes `UserPromptSubmit` with `session_id`, `prompt`, and
+  `transcript_path`. The hook reads the most recent non-sidechain assistant
+  usage record.
+- Codex invokes `SessionStart`, `UserPromptSubmit`, and `Stop`. The hook records
+  activity on `Stop` because Codex documents its transcript format as unstable
+  for hook integrations.
+- Both clients receive either no output, a `systemMessage`, or a
+  `{"decision":"block","reason":"..."}` response.
+- The hook catches unexpected errors and exits successfully. Cache visibility
+  must not trap an agent session.
+
+Official hook references:
+
+- [Claude Code hooks reference](https://code.claude.com/docs/en/hooks)
+- [Codex hooks reference](https://learn.chatgpt.com/docs/hooks)
+
+## Configuration
+
+| variable | default | purpose |
+|---|---:|---|
+| `CACHE_GATE_CLAUDE_TTL_MIN` | `60` | Claude Code cache TTL in minutes |
+| `CACHE_GATE_CLAUDE_WARN_MIN` | `50` | Claude Code warning threshold |
+| `CACHE_GATE_CODEX_TTL_MIN` | `30` | Codex minimum cache TTL in minutes |
+| `CACHE_GATE_CODEX_WARN_MIN` | `25` | Codex warning threshold |
+| `CACHE_GATE_TTL_MIN` | unset | Override the TTL for either client |
+| `CACHE_GATE_WARN_MIN` | unset | Override the warning threshold for either client |
+| `CACHE_GATE_STATE_DIR` | `~/.cache/cache-gate-hook` | Override the private state directory |
+
+Client-specific variables take precedence over the generic variables. The old
+`CLAUDE_CACHE_TTL_MIN` and `CLAUDE_CACHE_WARN_MIN` names remain supported for
+existing Claude Code installations.
+
+If your Claude setup uses the standard five-minute cache, set both Claude
+values where Claude Code starts:
+
+```bash
+export CACHE_GATE_CLAUDE_TTL_MIN=5
+export CACHE_GATE_CLAUDE_WARN_MIN=4
+```
+
+## List Claude Code sessions
+
+From a project directory:
+
+```bash
+python3 cache_gate.py --list
+```
+
+The command lists up to 20 Claude Code transcripts for that project with their
+last turn, idle time, context size, and estimated cache state. Codex session
+status appears through its `SessionStart` hook instead.
+
+## Uninstall
+
+Remove commands containing `cache_gate.py` from these user-level files:
+
+- Claude Code: `~/.claude/settings.json` under `hooks.UserPromptSubmit`
+- Codex: `~/.codex/hooks.json` under `hooks.SessionStart`,
+  `hooks.UserPromptSubmit`, and `hooks.Stop`
+
+You may also remove `~/.cache/cache-gate-hook/`. It contains only per-session
+timestamps and prompt hashes.
 
 ## Development
 
 ```bash
-python3 tests/test_cache_gate.py   # or: python3 -m pytest tests/
+python3 -B -m py_compile cache_gate.py tests/test_cache_gate.py
+python3 -B tests/test_cache_gate.py
+bash -n install.sh
 ```
 
-CI runs the same on every push and PR. `main` is protected: changes land via
-pull request with green CI, no force pushes.
+The direct test runner uses only the Python standard library. CI runs the same
+checks on every push and pull request.
 
 ## License
 
